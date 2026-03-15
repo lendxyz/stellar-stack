@@ -185,6 +185,16 @@ This mechanism ensures that the share price remains stable in EUR terms while ac
 
 ---
 
+## Oracle Integration
+
+Note: Work in progress as the design will vary from our original codebase
+
+The Factory relies on an external price oracle adapter to convert the operation share price denominated in EUR into the subscription asset amount required on Stellar.
+
+We plan to leverage Reflector as our primary price oracle, combined with additional safety mechanisms to ensure that pricing and sales cannot be manipulated.
+
+---
+
 ## Operation lifecycle
 
 ```
