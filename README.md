@@ -16,10 +16,10 @@ graph TB
         KYC["KYC Flow"]
     end
 
-    subgraph Worker["Backend Worker"]
+    subgraph Worker["Backend"]
         IDX["Event Indexer"]
         API["REST API"]
-        SIG["KYC Signature Generator"]
+        SIG["Ed25519 Signing Service<br/>(KMS-backed)"]
     end
 
     subgraph Stellar["Stellar Network"]
@@ -75,6 +75,7 @@ The Factory is the primary entry point of the protocol. It orchestrates the full
 - Handle pre-deposits and token claims
 - Execute cancellation with automated investor refunds
 - Enable fund withdrawal by the operation issuer
+- Manage yield deposits and investor claim accounting
 - Emit protocol events for off-chain indexing
 
 **Key functions:**
@@ -88,24 +89,28 @@ The Factory is the primary entry point of the protocol. It orchestrates the full
 | `claim_tokens` | Claim OpLend tokens from predeposit | Investor |
 | `cancel_operation` | Cancel operation, enable refunds | Admin |
 | `refund` | Refund investor after cancellation | Investor |
-| `withdraw_funds` | Withdraw raised capital to destination | Admin |
+| `withdraw_funds` | Withdraw raised capital to destination | Admin (funding-complete guard + single-withdrawal guard) |
 
 **Investment flow — signature verification:**
 
 ```mermaid
 sequenceDiagram
     participant I as Investor
-    participant B as Backend
+    participant B as Backend (KMS)
     participant F as Factory Contract
 
     I->>B: KYC submission
     B->>B: KYC/AML check
-    B->>I: Signature (authorization)
-    I->>F: invest(shares, signature)
-    F->>F: Verify signature
-    F->>F: Check whitelist
+    B->>B: Build message: LEND_INVEST_V1 ∥ op_id ∥ investor ∥ amount ∥ nonce ∥ expiry
+    B->>B: Ed25519 sign via KMS
+    B->>I: Signature + nonce + expiry
+    I->>F: invest(op_id, amount, signature, nonce, expiry)
+    F->>F: Check expiry > current ledger
+    F->>F: Check nonce not consumed
+    F->>F: ed25519_verify(backend_pubkey, message, signature)
+    F->>F: Check allowlist
     F->>F: Query oracle (EUR/USDC)
-    F->>F: Transfer USDC
+    F->>F: Transfer USDC from investor
     F->>F: Mint OpLend tokens
     F->>F: Emit Invested event
     F->>I: OpLend tokens
@@ -117,20 +122,73 @@ Each real estate operation deploys a dedicated OpLend token representing investo
 
 **Interface:** Implements the Soroban Token Interface ([SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md)) with 9 standard functions + 6 admin functions.
 
-**Compliance features:**
+**Compliance features built on [OpenZeppelin Contracts for Stellar](https://docs.openzeppelin.com/stellar-contracts):**
 
-- **Whitelist-based transfers:** Only whitelisted addresses can send and receive tokens
-- **Blacklist enforcement:** Blocked addresses cannot interact with the token
-- **Capped supply:** Total supply is hard-capped to the operation's funding target
-- **Transfer restrictions:** All transfers validated against compliance rules before execution
+- **Allowlist-based transfers:** Only addresses on the allowlist can send and receive tokens. Built on OZ `Allowlist` module.
+- **Blocklist enforcement:** Sanctioned or blocked addresses cannot interact with the token. Built on OZ `Blocklist` module.
+- **Capped supply:** Total supply is hard-capped to the operation's funding target. Built on OZ `Capped` extension.
+- **Pausable:** Emergency halt on all token operations. Built on OZ `Pausable` module.
+
+**Transfer with compliance enforcement:**
+
+```rust
+fn transfer(e: Env, from: Address, to: MuxedAddress, amount: i128) {
+    from.require_auth();
+    check_nonnegative_amount(amount);
+    require_not_paused(&e);
+    require_allowed(&e, &from);
+    require_allowed(&e, &to.address());
+    require_not_blocked(&e, &from);
+    require_not_blocked(&e, &to.address());
+
+    spend_balance(&e, from.clone(), amount);
+    let to_addr: Address = to.address();
+    receive_balance(&e, to_addr.clone(), amount);
+    events::Transfer { from, to: to_addr, to_muxed_id: to.id(), amount }.publish(&e);
+}
+```
+
+**Mint with supply cap enforcement:**
+
+```rust
+fn mint(e: Env, to: Address, amount: i128) {
+    check_nonnegative_amount(amount);
+    let admin = read_administrator(&e);
+    admin.require_auth();
+
+    let supply = read_total_supply(&e);
+    let cap = read_supply_cap(&e);
+    if supply.checked_add(amount).expect("overflow") > cap {
+        panic_with_error!(&e, Error::SupplyCapExceeded);
+    }
+
+    receive_balance(&e, to.clone(), amount);
+    write_total_supply(&e, supply + amount);
+    events::MintWithAmountOnly { to, amount }.publish(&e);
+}
+```
 
 **Storage model:**
 
 | Data | Storage Type | Rationale |
 |------|-------------|-----------|
-| Admin, config | Instance | Shared across all calls, high access frequency |
+| Admin, config, supply cap | Instance | Shared across all calls, high access frequency |
 | Investor balances | Persistent | Must survive archival, per-user data |
-| Allowances | Temporary | Short-lived approvals, auto-cleanup acceptable |
+| Allowances | Persistent | With explicit `expiry_ledger` field in data — Temporary storage permanently deletes entries at TTL 0, unacceptable for securities tokens |
+
+**Allowance structure:**
+
+```rust
+#[contracttype]
+pub struct AllowanceData {
+    pub amount: i128,
+    pub expiry_ledger: u32, // Explicit expiration, checked on each transfer_from
+}
+// Key: DataKey::Allowance(AllowanceDataKey { from, spender })
+// Storage: Persistent (not Temporary)
+```
+
+This avoids the silent-failure risk of Temporary storage: if a Persistent entry is archived, it is automatically restored when accessed (Protocol 23+), whereas a Temporary entry is permanently lost.
 
 ### 1.3 Oracle Integration (Reflector)
 
@@ -145,11 +203,38 @@ Operations are priced in EUR while investors settle in USDC. The Factory integra
 
 **Safety mechanisms:**
 
-- Price staleness check: reject if oracle data is older than a configurable threshold
-- Price deviation bounds: reject if price moves beyond acceptable range between simulation and execution
-- Fallback: operation can be paused if oracle is unavailable
+- **Staleness check:** Reject if oracle `timestamp` is older than 600 seconds (~2× Reflector's refresh cadence)
+- **Deviation bounds:** Reject if price deviates more than 2% between transaction simulation and execution
+- **Pause fallback:** Operation can be paused if oracle is unavailable
 
 **Implementation:**
+
+```rust
+// Reflector integration
+mod reflector {
+    soroban_sdk::contractimport!(file = "reflector_oracle.wasm");
+}
+
+let oracle = reflector::Client::new(&env, &oracle_address);
+let price_data: PriceData = oracle.lastprice(&Asset::Other(Symbol::new(&env, "EUR")))
+    .expect("Oracle price unavailable");
+
+// Staleness check
+let age = env.ledger().timestamp() - price_data.timestamp;
+if age > 600 {
+    panic_with_error!(&env, Error::OraclePriceStale);
+}
+
+let eur_usdc_rate = price_data.price; // Reflector returns 14-decimal fixed-point
+let usdc_amount = (shares * price_per_share_eur * eur_usdc_rate) / REFLECTOR_PRECISION;
+```
+
+**Oracle addresses:**
+
+| Network | Contract |
+|---------|----------|
+| Mainnet | `CAFJZQWSED6YAWZU3GWRTOCNPPCGBN32L7QV43XX5LZLFTK6JLN34DLN` |
+| Testnet | `CAVLP5DH2GJPZMVO7IJY4CVOD5MWEFTJFVPD2YY2FQXOQHRGHK4D6HLP` |
 
 ```mermaid
 graph LR
@@ -164,11 +249,124 @@ graph LR
 
 ---
 
-## 2. Dual-Wallet Architecture
+## 2. Backend Signature & Compliance Architecture
+
+### 2.1 Signature Scheme (Ed25519)
+
+Every investment requires a cryptographic authorization from the backend. The backend only issues this authorization after successful KYC/AML verification. The Factory contract verifies the signature on-chain before processing the investment.
+
+**Signed message format:**
+
+```
+LEND_INVEST_V1 || operation_id (8 bytes BE) || investor (32 bytes) || amount (16 bytes BE) || nonce (8 bytes BE) || expiry_ledger (8 bytes BE)
+```
+
+- `LEND_INVEST_V1` domain prefix prevents cross-protocol replay
+- All fields are fixed-width, eliminating ambiguous parsing
+- `nonce` is monotonically increasing per investor, stored on-chain after consumption
+- `expiry_ledger` bounds signature validity (~1 hour at 720 ledgers × 5s)
+
+**On-chain verification:**
+
+```rust
+// Verify backend authorization
+let backend_pubkey: BytesN<32> = env.storage().instance().get(&DataKey::BackendSigner).unwrap();
+let message = build_invest_message(&env, operation_id, &investor, amount, nonce, expiry);
+
+if env.ledger().sequence() > expiry {
+    panic_with_error!(&env, Error::SignatureExpired);
+}
+
+let nonce_key = DataKey::Nonce(investor.clone(), nonce);
+if env.storage().persistent().has(&nonce_key) {
+    panic_with_error!(&env, Error::NonceAlreadyUsed);
+}
+
+env.crypto().ed25519_verify(&backend_pubkey, &message.into(), &signature);
+env.storage().persistent().set(&nonce_key, &true);
+```
+
+### 2.2 Custody Model
+
+| Aspect | Design |
+|--------|--------|
+| Key type | Ed25519 keypair |
+| Public key | Stored on-chain in Factory (`DataKey::BackendSigner`) |
+| Private key | Cloud KMS (AWS KMS or GCP Cloud HSM), envelope encryption |
+| Access control | IAM policy: only the compliance-backend service account can invoke `sign()` |
+| Audit trail | All sign requests logged with investor ID, operation ID, timestamp, decision |
+
+The backend service is stateless. It receives a KYC-check (or identification check) result from the compliance provider, evaluates rules (jurisdiction, accreditation, investment limits), and if approved, calls KMS to sign the invest message.
+
+### 2.3 Failure & Compromise Recovery
+
+**Signer unavailable (backend down):**
+- Impact: New investments blocked. Existing tokens, transfers, refunds and yield claims all continue to function.
+- Recovery: Backend deployed with redundancy (multi-AZ), auto-scaling and health checks.
+
+**Key compromise (private key leaked):**
+1. Admin calls `set_backend_signer(new_pubkey)` on Factory — immediate effect
+2. All outstanding signatures (old key) become invalid — investors re-request authorization
+3. Nonce tracking prevents replay of any previously issued signature
+4. Exposure assessment: compromised key allows unauthorized `invest()` calls (USDC flows INTO the contract, not out — no direct fund theft)
+
+**Key rotation procedure:**
+1. Generate new keypair in KMS
+2. Admin calls `set_backend_signer(new_pubkey)`
+3. Backend switches to new key for all subsequent signatures
+4. Old signatures fail `ed25519_verify` immediately
+
+### 2.4 Admin Multi-Sig
+
+| Phase | Model | Trust Surface |
+|-------|-------|---------------|
+| Tranche 1 | Single backend signer (KMS) + single admin | Compliance decisions centralized. Admin operations centralized. |
+| Tranche 2 | Backend signer + Custom Account Contract for admin (2-of-3 multi-sig) | Admin operations require 2 of 3 independent parties to co-sign. No single party can act alone. |
+
+**Multi-sig composition (2-of-3):**
+
+Any critical admin operation (withdraw funds, change signer, pause, upgrade contracts) requires signatures from at least 2 of the 3 keyholders:
+
+| Keyholder | Role | Rationale |
+|-----------|------|-----------|
+| **Lend core team** | Day-to-day operations, protocol management | Primary operator with domain knowledge (3 signers) |
+| **Advisor / board member** | Regulatory oversight | Third party afiliated with Lend but not involved with Lend day-to-day operations |
+
+This structure ensures that no single entity — including Lend itself — can unilaterally withdraw funds, modify compliance parameters, or upgrade contracts. The two-party threshold balances operational agility with external oversight.
+
+**Implementation via Soroban Custom Account Contract:**
+
+Soroban natively supports [Custom Account Contracts](https://developers.stellar.org/docs/learn/fundamentals/contract-development/authorization) implementing `__check_auth`. This enables multi-sig at the account level without wrapper contracts:
+
+```rust
+impl CustomAccountInterface for AdminMultiSig {
+    type Signature = Vec<BytesN<64>>;
+    type Error = AccError;
+
+    fn __check_auth(
+        env: Env,
+        signature_payload: Hash<32>,
+        signatures: Vec<BytesN<64>>,
+        _auth_context: Vec<Context>,
+    ) -> Result<(), AccError> {
+        let signers: Vec<BytesN<32>> = env.storage().instance().get(&DataKey::Signers).unwrap();
+        let threshold: u32 = 2; // 2-of-3
+        let valid = signatures.iter().filter(|sig| {
+            signers.iter().any(|pk| env.crypto().ed25519_verify(pk, &signature_payload.into(), sig).is_ok())
+        }).count();
+        if valid < threshold { return Err(AccError::NotEnoughSigners); }
+        Ok(())
+    }
+}
+```
+
+---
+
+## 3. Dual-Wallet Architecture
 
 A key differentiator of the Lend protocol is the ability for investors to connect both a Stellar wallet and an EVM wallet under a single platform account. This enables cross-chain capital onboarding while keeping investment settlement on Stellar.
 
-### 2.1 Wallet Connection
+### 3.1 Wallet Connection
 
 **Stellar wallet:**
 - Connected via [Stellar Wallet Kit](https://stellarwalletskit.dev/)
@@ -185,23 +383,22 @@ A key differentiator of the Lend protocol is the ability for investors to connec
 graph LR
     subgraph Account["Lend Platform Account — KYC verified"]
         direction LR
-        SW["🔵 Stellar Wallet<br/>Lobster / Freighter / xBull<br/><br/>• Invest<br/>• Receive OpLend tokens<br/>• Claim yields<br/>• Sign transactions"]
-        EW["🟣 EVM Wallet (optional)<br/>Rabby / MetaMask<br/><br/>• Bridge USDC to Stellar<br/>• Approve bridge transactions"]
+        SW["Stellar Wallet<br/>Lobster / Freighter / xBull<br/><br/>• Invest<br/>• Receive OpLend tokens<br/>• Claim yields<br/>• Sign transactions"]
+        EW["EVM Wallet (optional)<br/>Rabby / MetaMask<br/><br/>• Bridge USDC to Stellar<br/>• Approve bridge transactions"]
     end
 
     SW -.-|"linked under<br/>same account"| EW
 
     classDef stellar fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
     classDef evm fill:#f5eef8,stroke:#6c3483,color:#6c3483
-    classDef account fill:#f8f9fa,stroke:#2c3e50,color:#2c3e50
 
     class SW stellar
     class EW evm
 ```
 
-Both wallets are linked to the same KYC-verified identity. The Stellar wallet is the primary wallet that receives OpLend tokens and weekly yield distributions. The EVM wallet is optional and used exclusively for cross-chain capital bridging.
+Both wallets are linked to the same KYC-verified identity. The Stellar wallet is the primary wallet that receives OpLend tokens and yield distributions. The EVM wallet is optional and used exclusively for cross-chain capital bridging.
 
-### 2.2 User Flows
+### 3.2 User Flows
 
 **Flow A — Stellar-native investor:**
 
@@ -223,15 +420,15 @@ Both wallets are linked to the same KYC-verified identity. The Stellar wallet is
 7. Allbridge bridges USDC from EVM to investor's Stellar wallet
 8. Factory contract processes investment from Stellar wallet
 9. Receive OpLend tokens on Stellar wallet
-10. Receive weekly yield distributions to Stellar wallet
+10. Claim yield via `claim_yield()` at any time
 
 **Key principle:** The bridge is a one-way capital onboarding mechanism. Once USDC arrives on Stellar, all subsequent operations (investment, yield distribution, token transfers) happen natively on Stellar.
 
 ---
 
-## 3. Cross-Chain Bridge (Allbridge Core)
+## 4. Cross-Chain Bridge (Allbridge Core)
 
-### 3.1 Architecture
+### 4.1 Architecture
 
 Allbridge Core is integrated to enable USDC transfers from EVM chains into Stellar. The bridge flow is embedded directly in the Lend frontend, presenting a seamless single-session experience.
 
@@ -255,7 +452,27 @@ graph LR
     class SW,FC stellar
 ```
 
-### 3.2 Frontend Integration
+### 4.2 Canonical vs Wrapped USDC
+
+USDC bridged via Allbridge arrives as Allbridge-wrapped USDC, not as canonical Stellar USDC (issuer: `GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN`).
+
+**Mitigation strategy:**
+
+- The Factory contract maintains an admin-managed allowlist of accepted USDC token addresses
+- Canonical Stellar USDC is the default and always accepted
+- Allbridge-wrapped USDC can be added to the allowlist after explicit due diligence on bridge risk
+- The token address is verified on every `invest()` call:
+
+```rust
+let allowed_tokens: Vec<Address> = env.storage().instance().get(&DataKey::AllowedUsdcTokens).unwrap();
+if !allowed_tokens.contains(&usdc_token) {
+    panic_with_error!(&env, Error::UnsupportedUsdcToken);
+}
+```
+
+This ensures the protocol never silently accepts an unknown or untrusted token.
+
+### 4.3 Frontend Integration
 
 The Allbridge SDK is integrated into the Lend frontend. The user experience is:
 
@@ -270,24 +487,24 @@ The bridge and investment are presented as a single guided process, but they are
 
 ---
 
-## 4. Compliance Layer
+## 5. Compliance Layer
 
-### 4.1 Regulatory Framework
+### 5.1 Regulatory Framework
 
 Lend operates under French financial regulation. Each tokenized operation requires a formal investment document (DIS — Document d'Information Synthétique) submitted to the Autorité des Marchés Financiers (AMF).
 
-### 4.2 On-Chain Compliance
+### 5.2 On-Chain Compliance
 
 Compliance is **structural**, not declarative. It is enforced at the smart contract level:
 
-**Whitelist/Blacklist (Factory + OpLend):**
-- Only whitelisted addresses can invest through the Factory
-- Only whitelisted addresses can receive OpLend token transfers
-- Blacklisted addresses are blocked from all protocol interactions
-- Whitelist/blacklist managed by protocol admin
+**Allowlist/Blocklist (Factory + OpLend):**
+- Only addresses on the allowlist can invest through the Factory
+- Only addresses on the allowlist can receive OpLend token transfers
+- Blocked addresses are excluded from all protocol interactions
+- Allowlist/blocklist managed by protocol admin
 
 **Backend Signature Authorization:**
-- Every investment requires a cryptographic signature generated by the backend
+- Every investment requires an Ed25519 signature generated by the backend (see Section 2)
 - The backend only generates signatures after successful KYC/AML verification
 - The Factory contract verifies the signature on-chain before processing the investment
 - This creates a two-layer compliance gate: off-chain verification + on-chain enforcement
@@ -297,7 +514,7 @@ Compliance is **structural**, not declarative. It is enforced at the smart contr
 - Required for regulatory compliance: each tokenized bond position must be linked to a real-world investor identity
 - Sanctions and AML screening performed against relevant databases before signature generation
 
-### 4.3 Compliance Flow
+### 5.3 Compliance Flow
 
 ```mermaid
 sequenceDiagram
@@ -309,67 +526,14 @@ sequenceDiagram
     I->>B: Submit identity
     B->>C: KYC/AML screening
     C->>B: Result (pass/fail)
-    B->>I: Signature (if passed)
-    I->>F: invest(shares, signature)
-    F->>F: Verify signature
-    F->>F: Check whitelist
+    B->>B: Build & sign invest message (KMS)
+    B->>I: Signature + nonce + expiry (if passed)
+    I->>F: invest(shares, signature, nonce, expiry)
+    F->>F: Verify signature (ed25519_verify)
+    F->>F: Check nonce not consumed
+    F->>F: Check allowlist
     F->>F: Process investment
     F->>I: Mint OpLend tokens
-```
-
----
-
-## 5. Backend Worker & Event Indexing
-
-### 5.1 Role
-
-The backend worker maintains an accurate off-chain representation of the protocol state by continuously indexing events emitted by the Factory and OpLend contracts.
-
-### 5.2 Data Sources
-
-| Source | Used For |
-|--------|----------|
-| **Soroban RPC** (`getEvents`) | Contract events, transaction simulation, contract invocation |
-| **Horizon** | Account balances, transaction history, asset metadata, network data |
-
-### 5.3 Indexed Events
-
-| Event | Source | Data |
-|-------|--------|------|
-| `OperationCreated` | Factory | Operation ID, name, total shares, price, OpLend token address |
-| `OperationStarted` | Factory | Operation ID, timestamp |
-| `OperationPaused` | Factory | Operation ID |
-| `OperationCanceled` | Factory | Operation ID |
-| `OperationFinished` | Factory | Operation ID, total funded |
-| `Invested` | Factory | Operation ID, investor address, shares, USDC amount |
-| `Predeposit` | Factory | Operation ID, investor address, shares |
-| `ClaimedOpToken` | Factory | Operation ID, investor address, token amount |
-| `Refunded` | Factory | Operation ID, investor address, USDC amount |
-
-### 5.4 Reconstructed State
-
-The worker reconstructs and maintains:
-
-- **Operations:** list, status, funding progress, metadata
-- **Investor positions:** allocations per operation, token balances, claimable amounts
-- **Protocol metrics:** TVL, total capital deployed, unique investors, operation count
-
-
-### 5.5 Architecture
-
-```mermaid
-graph LR
-    RPC["Soroban RPC<br/>(events)"] --> W["Backend Worker<br/>Indexer + Database<br/>API + KYC Signatures"]
-    HOR["Horizon<br/>(accounts)"] --> W
-    W --> FE["Frontend<br/>(React)<br/>REST API consumer"]
-
-    classDef stellar fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
-    classDef worker fill:#fef9e7,stroke:#f39c12,color:#b9770e
-    classDef frontend fill:#d5f5e3,stroke:#1e8449,color:#1e8449
-
-    class RPC,HOR stellar
-    class W worker
-    class FE frontend
 ```
 
 ---
@@ -395,20 +559,96 @@ All yield distributions are visible on-chain through Stellar Explorer. Investors
 
 ---
 
-## 7. Incentive Mechanism
+## 7. Attack Surface & Sequencing Strategy
 
-To encourage adoption and anchor capital on Stellar, Lend introduces a **1.25x multiplier on Lend Points** for investments executed on the Stellar instance during the first year.
+### 7.1 Component Inventory & Trust Model
 
-This incentive is designed to:
-- Position Stellar as the preferred chain for Lend investors
-- Drive early adoption and long-term user anchoring
-- Create a concrete mechanism for TVL growth on Stellar
+| Component | Trust Level | Failure Mode |
+|-----------|-------------|-------------|
+| Factory Contract | Trustless (code) | Smart contract bug → pause + upgrade |
+| OpLend Token | Trustless (code, OZ-based) | Bug in compliance hooks → pause |
+| Backend Signer | Trusted (centralized) | Down → investments blocked. Compromised → unauthorized invest (no fund theft) |
+| Reflector Oracle | External trusted | Stale/wrong price → staleness check rejects, pause fallback |
+| Allbridge | External trusted | Bridge exploit → only wrapped USDC affected, canonical USDC safe |
+| Admin key | Trusted (centralized → multi-sig) | Compromised → full control. Mitigation: multi-sig + timelock (Tranche 2) |
 
-At this stage, incentives are limited to points-based rewards. This grant is strictly scoped to development and does not include capital allocation for yield subsidies.
+### 7.2 Sequencing
+
+The architecture is designed to be deployed incrementally, reducing attack surface at each phase:
+
+**Tranche 1 — Stellar-native only (4 components):**
+- Factory + OpLend + Backend Signer + Reflector Oracle
+- Only canonical Stellar USDC accepted
+- No cross-chain bridge, no dual-wallet complexity
+- Focus: compliance enforcement, signature verification, yield distribution
+
+**Tranche 2 — Cross-chain extension (+2 components):**
+- Add Allbridge integration + dual-wallet
+- Admin migrates to Custom Account Contract (2-of-3 multi-sig)
+- Timelock on `withdraw_funds` and contract upgrades
+
+**Rationale:** By deferring Allbridge to Tranche 2, the initial deployment eliminates bridge-related risk entirely. Tranche 1 investors interact with Stellar-native USDC only, and the attack surface is limited to on-chain contracts + one off-chain signer.
+
+### 7.3 Mitigation Summary
+
+| Risk | Mitigation |
+|------|------------|
+| Smart contract bug | OpenZeppelin Contracts for Stellar (audited base), Pausable module, WASM upgrade path, testing + fuzzing |
+| Backend signer compromise | KMS custody, IAM isolation, key rotation procedure, nonce replay protection, rate limiting |
+| Oracle manipulation | Staleness check (600s), deviation bounds (2%), pause fallback, accounting in USDC (oracle only for EUR conversion) |
+| Bridge exploit (Tranche 2) | One-way only (onboard), USDC issuer allowlist, canonical-first strategy |
+| Admin key compromise | Tranche 1: immediate risk. Tranche 2: 2-of-3 multi-sig + 48h timelock on withdrawals |
+| Nonce exhaustion | 64-bit space (18.4 quintillion values per investor) |
 
 ---
 
-## 8. Design Decisions
+## 8. Backend Worker & Event Indexing
+
+### 8.1 Role
+
+The backend worker maintains an accurate off-chain representation of the protocol state by continuously indexing events emitted by the Factory and OpLend contracts.
+
+### 8.2 Data Sources
+
+| Source | Used For |
+|--------|----------|
+| **Soroban RPC** (`getEvents`) | Contract events, transaction simulation, contract invocation |
+| **Horizon** | Account balances, transaction history, asset metadata, network data |
+
+### 8.3 Indexed Events
+
+| Event | Source | Data |
+|-------|--------|------|
+| `OperationCreated` | Factory | Operation ID, name, total shares, price, OpLend token address |
+| `OperationStarted` | Factory | Operation ID, timestamp |
+| `OperationPaused` | Factory | Operation ID |
+| `OperationCanceled` | Factory | Operation ID |
+| `OperationFinished` | Factory | Operation ID, total funded |
+| `Invested` | Factory | Operation ID, investor address, shares, USDC amount |
+| `Predeposit` | Factory | Operation ID, investor address, shares |
+| `ClaimedOpToken` | Factory | Operation ID, investor address, token amount |
+| `Refunded` | Factory | Operation ID, investor address, USDC amount |
+
+### 8.4 Architecture
+
+```mermaid
+graph LR
+    RPC["Soroban RPC<br/>(events)"] --> W["Backend Worker<br/>Indexer + Database<br/>API + Signing Service"]
+    HOR["Horizon<br/>(accounts)"] --> W
+    W --> FE["Frontend<br/>(React)<br/>REST API consumer"]
+
+    classDef stellar fill:#d6eaf8,stroke:#1a3a5c,color:#1a3a5c
+    classDef worker fill:#fef9e7,stroke:#f39c12,color:#b9770e
+    classDef frontend fill:#d5f5e3,stroke:#1e8449,color:#1e8449
+
+    class RPC,HOR stellar
+    class W worker
+    class FE frontend
+```
+
+---
+
+## 9. Design Decisions
 
 ### Why Soroban smart contracts over Stellar Classic Assets?
 
@@ -442,7 +682,7 @@ Stellar's anchor network provides exactly this. Multiple regulated anchors are a
 
 ---
 
-## 9. Operation Lifecycle
+## 10. Operation Lifecycle
 
 ```mermaid
 graph TD
@@ -469,19 +709,33 @@ graph TD
 
 ---
 
-## 10. Deployment Architecture
+## 11. Deployment Architecture
 
 ### Testnet (current)
 
 - Factory contract deployed on Soroban testnet
 - OpLend token contract deployed on Soroban testnet
-- Testnet address: [CATQIEC3UAAEPYBPFBJWHGY3WYQJJZ344NXAADZ7HWICA2SWG7NU5III](https://testnet.stellarchain.io/contracts/CATQIEC3UAAEPYBPFBJWHGY3WYQJJZ344NXAADZ7HWICA2SWG7NU5III)
+- Testnet address: [`CATQIEC3UAAEPYBPFBJWHGY3WYQJJZ344NXAADZ7HWICA2SWG7NU5III`](https://testnet.stellarchain.io/contracts/CATQIEC3UAAEPYBPFBJWHGY3WYQJJZ344NXAADZ7HWICA2SWG7NU5III)
 - Source code: [github.com/lendxyz/lend-contracts-soroban](https://github.com/lendxyz/lend-contracts-soroban)
 
 ### Mainnet (planned)
 
 - Production deployment with hardened configuration
 - Backend worker indexing mainnet events
-- Reflector oracle on mainnet feeds
+- Reflector oracle on mainnet feeds (`CAFJZQWSED6YAWZU3GWRTOCNPPCGBN32L7QV43XX5LZLFTK6JLN34DLN`)
+- USDC canonical issuer: `GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN`
 - Allbridge configured for mainnet USDC
 - Security review of all contract parameters completed before deployment
+
+---
+
+## 12. Incentive Mechanism
+
+To encourage adoption and anchor capital on Stellar, Lend introduces a **1.25x multiplier on Lend Points** for investments executed on the Stellar instance during the first year.
+
+This incentive is designed to:
+- Position Stellar as the preferred chain for Lend investors
+- Drive early adoption and long-term user anchoring
+- Create a concrete mechanism for TVL growth on Stellar
+
+At this stage, incentives are limited to points-based rewards. This grant is strictly scoped to development and does not include capital allocation for yield subsidies.
